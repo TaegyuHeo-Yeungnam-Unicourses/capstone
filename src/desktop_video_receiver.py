@@ -135,11 +135,11 @@ class SegmentRecorder:
         if self.writer is None or self.temp_path is None:
             return
 
+        elapsed = time.monotonic() - self.started_at_monotonic
+        end_label = timestamp()
+
         self.writer.release()
         self.writer = None
-
-        elapsed = self.elapsed_seconds
-        end_label = timestamp()
 
         if completed:
             final_path = self.output_dir / (
