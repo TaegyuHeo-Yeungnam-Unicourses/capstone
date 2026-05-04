@@ -1,2 +1,4 @@
 opencv-python>=4.8
 numpy>=1.24
+paho-mqtt>=2.0
+psutil>=5.9
