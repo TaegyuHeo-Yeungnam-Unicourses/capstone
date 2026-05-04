@@ -1,58 +1,81 @@
 #!/usr/bin/env python3
-"""Raspberry Pi realtime camera sender with MQTT status publishing.
+"""Raspberry Pi RTSP video publisher with MQTT status publishing.
 
-This program continuously captures frames from a Raspberry Pi camera or USB
-camera, compresses every frame as JPEG, and streams the frames to one desktop
-client through a length-prefixed TCP socket.
+This program no longer sends custom TCP-JPEG frames. It starts an external
+camera/encoder pipeline and publishes an H.264 stream to an RTSP server.
 
-It can also publish Raspberry Pi status information to an MQTT broker. The
-video stream and the status channel are intentionally separated:
+Recommended topology:
+    Raspberry Pi camera -> libcamera-vid/ffmpeg -> RTSP server -> desktop viewer
 
-- TCP socket: high-bandwidth realtime video frames
-- MQTT: low-bandwidth device status telemetry
+The RTSP server can run on the Raspberry Pi, the desktop, or another machine.
+For a simple local-lab setup, run MediaMTX on the Raspberry Pi and publish to:
+    rtsp://127.0.0.1:8554/capstone
+Desktop clients then view:
+    rtsp://<raspberry-pi-ip>:8554/capstone
+
+MQTT is kept as a separate low-bandwidth status channel.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import signal
 import socket
-import struct
+import subprocess
 import sys
 import time
-from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
-import psutil
 import paho.mqtt.client as mqtt
+import psutil
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream Raspberry Pi camera frames to a desktop over TCP and publish status over MQTT."
+        description="Publish Raspberry Pi camera video as RTSP and publish device status over MQTT."
     )
     parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Bind address. Use 0.0.0.0 to listen on Wi-Fi and Ethernet interfaces.",
+        "--source",
+        choices=("libcamera", "v4l2"),
+        default="libcamera",
+        help="Camera capture backend. Use libcamera for Raspberry Pi Camera Module, v4l2 for USB webcam.",
     )
-    parser.add_argument("--port", type=int, default=5000, help="TCP video streaming port.")
     parser.add_argument(
-        "--camera",
-        default="0",
-        help="OpenCV camera index or device path. Examples: 0, /dev/video0",
+        "--device",
+        default="/dev/video0",
+        help="V4L2 device path used only when --source v4l2 is selected.",
     )
-    parser.add_argument("--width", type=int, default=640, help="Capture width.")
-    parser.add_argument("--height", type=int, default=480, help="Capture height.")
-    parser.add_argument("--fps", type=int, default=15, help="Requested capture FPS.")
+    parser.add_argument("--width", type=int, default=1280, help="Capture width.")
+    parser.add_argument("--height", type=int, default=720, help="Capture height.")
+    parser.add_argument("--fps", type=int, default=30, help="Capture frame rate.")
     parser.add_argument(
-        "--quality",
+        "--bitrate",
         type=int,
-        default=80,
-        choices=range(1, 101),
-        metavar="1-100",
-        help="JPEG quality. Lower values reduce bandwidth and image quality.",
+        default=2_500_000,
+        help="Target video bitrate in bits per second. Used by libcamera-vid and v4l2 ffmpeg encoding.",
+    )
+    parser.add_argument(
+        "--rtsp-url",
+        default="rtsp://127.0.0.1:8554/capstone",
+        help="RTSP publish URL. Requires an RTSP server such as MediaMTX to be running.",
+    )
+    parser.add_argument(
+        "--public-rtsp-url",
+        default=None,
+        help="URL that desktop clients should use. If omitted, --rtsp-url is reported in MQTT status.",
+    )
+    parser.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp"),
+        default="tcp",
+        help="RTSP transport used by ffmpeg while publishing.",
+    )
+    parser.add_argument(
+        "--ffmpeg-loglevel",
+        default="warning",
+        help="ffmpeg log level. Examples: quiet, error, warning, info.",
     )
     parser.add_argument(
         "--mqtt-host",
@@ -67,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mqtt-client-id",
-        default="capstone-raspi-video-sender",
+        default="capstone-raspi-rtsp-publisher",
         help="MQTT client ID.",
     )
     parser.add_argument(
@@ -79,29 +102,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def camera_argument(value: str) -> int | str:
-    """Return an int camera index when possible, otherwise a device path/string."""
-    try:
-        return int(value)
-    except ValueError:
-        return value
-
-
-def open_camera(args: argparse.Namespace) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(camera_argument(args.camera))
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Cannot open camera {args.camera!r}. Check the camera connection and permission."
-        )
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
-    return cap
-
-
 def read_cpu_temperature_celsius() -> float | None:
-    """Read Raspberry Pi CPU temperature when the Linux thermal file exists."""
     temp_file = Path("/sys/class/thermal/thermal_zone0/temp")
     if not temp_file.exists():
         return None
@@ -113,7 +114,6 @@ def read_cpu_temperature_celsius() -> float | None:
 
 
 def local_ipv4_addresses() -> list[str]:
-    """Return local non-loopback IPv4 addresses for status monitoring."""
     addresses: list[str] = []
     for items in psutil.net_if_addrs().values():
         for item in items:
@@ -124,26 +124,32 @@ def local_ipv4_addresses() -> list[str]:
 
 def build_status_payload(
     *,
-    client_connected: bool,
-    frames_sent: int,
-    fps_avg: float,
-    last_frame_bytes: int,
-    video_host: str,
-    video_port: int,
+    args: argparse.Namespace,
+    started_at: float,
+    publisher_alive: bool,
+    capture_return_code: int | None,
+    ffmpeg_return_code: int | None,
 ) -> str:
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
+    public_url = args.public_rtsp_url or args.rtsp_url
 
     payload = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "hostname": socket.gethostname(),
         "ip_addresses": local_ipv4_addresses(),
-        "video_host": video_host,
-        "video_port": video_port,
-        "client_connected": client_connected,
-        "frames_sent": frames_sent,
-        "fps_avg": round(fps_avg, 2),
-        "last_frame_bytes": last_frame_bytes,
+        "stream_type": "rtsp",
+        "rtsp_url": public_url,
+        "publish_url": args.rtsp_url,
+        "source": args.source,
+        "width": args.width,
+        "height": args.height,
+        "fps": args.fps,
+        "bitrate": args.bitrate,
+        "publisher_alive": publisher_alive,
+        "capture_return_code": capture_return_code,
+        "ffmpeg_return_code": ffmpeg_return_code,
+        "uptime_seconds": round(time.monotonic() - started_at, 1),
         "cpu_percent": psutil.cpu_percent(interval=None),
         "memory_percent": memory.percent,
         "disk_percent": disk.percent,
@@ -153,8 +159,6 @@ def build_status_payload(
 
 
 class MqttStatusPublisher:
-    """Small wrapper that publishes Raspberry Pi status only when enabled."""
-
     def __init__(self, args: argparse.Namespace) -> None:
         self.enabled = args.mqtt_host is not None
         self.topic = args.mqtt_topic
@@ -187,108 +191,190 @@ class MqttStatusPublisher:
             self.client.disconnect()
 
 
-def send_frames(
-    client: socket.socket,
-    cap: cv2.VideoCapture,
-    args: argparse.Namespace,
-    status_publisher: MqttStatusPublisher,
-) -> None:
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), args.quality]
-    frame_count = 0
-    last_frame_bytes = 0
-    started_at = time.monotonic()
+@dataclass
+class PipelineProcesses:
+    capture_process: subprocess.Popen[bytes] | None
+    ffmpeg_process: subprocess.Popen[bytes]
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("[WARN] Failed to read a frame from camera.", file=sys.stderr)
-            time.sleep(0.05)
-            continue
+    def poll_capture(self) -> int | None:
+        if self.capture_process is None:
+            return None
+        return self.capture_process.poll()
 
-        encoded, buffer = cv2.imencode(".jpg", frame, encode_params)
-        if not encoded:
-            print("[WARN] Failed to JPEG-encode a frame.", file=sys.stderr)
-            continue
+    def poll_ffmpeg(self) -> int | None:
+        return self.ffmpeg_process.poll()
 
-        payload = buffer.tobytes()
-        last_frame_bytes = len(payload)
-        header = struct.pack("!I", last_frame_bytes)
-        client.sendall(header + payload)
+    def alive(self) -> bool:
+        capture_ok = self.capture_process is None or self.capture_process.poll() is None
+        ffmpeg_ok = self.ffmpeg_process.poll() is None
+        return capture_ok and ffmpeg_ok
 
-        frame_count += 1
-        elapsed = max(time.monotonic() - started_at, 0.001)
-        fps_avg = frame_count / elapsed
+    def stop(self) -> None:
+        for process in (self.ffmpeg_process, self.capture_process):
+            if process is not None and process.poll() is None:
+                process.send_signal(signal.SIGTERM)
 
-        status_payload = build_status_payload(
-            client_connected=True,
-            frames_sent=frame_count,
-            fps_avg=fps_avg,
-            last_frame_bytes=last_frame_bytes,
-            video_host=args.host,
-            video_port=args.port,
-        )
-        status_publisher.publish_if_due(status_payload)
-
-        if frame_count % 60 == 0:
-            print(f"[INFO] Sent {frame_count} realtime frames ({fps_avg:.1f} FPS avg)")
+        deadline = time.monotonic() + 5.0
+        for process in (self.ffmpeg_process, self.capture_process):
+            if process is None:
+                continue
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if process.poll() is None:
+                process.kill()
 
 
-def publish_idle_status(args: argparse.Namespace, status_publisher: MqttStatusPublisher) -> None:
-    status_payload = build_status_payload(
-        client_connected=False,
-        frames_sent=0,
-        fps_avg=0.0,
-        last_frame_bytes=0,
-        video_host=args.host,
-        video_port=args.port,
-    )
-    status_publisher.publish_if_due(status_payload)
+def start_libcamera_pipeline(args: argparse.Namespace) -> PipelineProcesses:
+    capture_command = [
+        "libcamera-vid",
+        "--timeout",
+        "0",
+        "--inline",
+        "--nopreview",
+        "--width",
+        str(args.width),
+        "--height",
+        str(args.height),
+        "--framerate",
+        str(args.fps),
+        "--bitrate",
+        str(args.bitrate),
+        "--codec",
+        "h264",
+        "--output",
+        "-",
+    ]
+    ffmpeg_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        args.ffmpeg_loglevel,
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-f",
+        "h264",
+        "-i",
+        "pipe:0",
+        "-c:v",
+        "copy",
+        "-f",
+        "rtsp",
+        "-rtsp_transport",
+        args.rtsp_transport,
+        args.rtsp_url,
+    ]
+
+    print("[INFO] Starting libcamera capture pipeline")
+    print("[INFO] " + " ".join(capture_command))
+    print("[INFO] " + " ".join(ffmpeg_command))
+
+    capture_process = subprocess.Popen(capture_command, stdout=subprocess.PIPE)
+    if capture_process.stdout is None:
+        raise RuntimeError("failed to open libcamera stdout pipe")
+
+    ffmpeg_process = subprocess.Popen(ffmpeg_command, stdin=capture_process.stdout)
+    capture_process.stdout.close()
+    return PipelineProcesses(capture_process=capture_process, ffmpeg_process=ffmpeg_process)
 
 
-def run_server(args: argparse.Namespace) -> None:
-    cap = open_camera(args)
+def start_v4l2_pipeline(args: argparse.Namespace) -> PipelineProcesses:
+    ffmpeg_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        args.ffmpeg_loglevel,
+        "-f",
+        "v4l2",
+        "-framerate",
+        str(args.fps),
+        "-video_size",
+        f"{args.width}x{args.height}",
+        "-i",
+        args.device,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-tune",
+        "zerolatency",
+        "-b:v",
+        str(args.bitrate),
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "rtsp",
+        "-rtsp_transport",
+        args.rtsp_transport,
+        args.rtsp_url,
+    ]
+
+    print("[INFO] Starting V4L2 RTSP pipeline")
+    print("[INFO] " + " ".join(ffmpeg_command))
+
+    ffmpeg_process = subprocess.Popen(ffmpeg_command)
+    return PipelineProcesses(capture_process=None, ffmpeg_process=ffmpeg_process)
+
+
+def start_pipeline(args: argparse.Namespace) -> PipelineProcesses:
+    if args.source == "libcamera":
+        return start_libcamera_pipeline(args)
+    return start_v4l2_pipeline(args)
+
+
+def run(args: argparse.Namespace) -> int:
     status_publisher = MqttStatusPublisher(args)
+    processes = start_pipeline(args)
+    started_at = time.monotonic()
+    public_url = args.public_rtsp_url or args.rtsp_url
+
+    print(f"[INFO] RTSP publish URL: {args.rtsp_url}")
+    print(f"[INFO] Desktop view URL: {public_url}")
 
     try:
-        with closing(cap), socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((args.host, args.port))
-            server.listen(1)
-            server.settimeout(1.0)
-            print(f"[INFO] Realtime video server listening on {args.host}:{args.port}")
-            print("[INFO] Run desktop_video_receiver.py from the desktop to connect.")
+        while True:
+            capture_rc = processes.poll_capture()
+            ffmpeg_rc = processes.poll_ffmpeg()
+            alive = processes.alive()
 
-            while True:
-                publish_idle_status(args, status_publisher)
-                try:
-                    client, address = server.accept()
-                except TimeoutError:
-                    continue
-                except socket.timeout:
-                    continue
+            status_payload = build_status_payload(
+                args=args,
+                started_at=started_at,
+                publisher_alive=alive,
+                capture_return_code=capture_rc,
+                ffmpeg_return_code=ffmpeg_rc,
+            )
+            status_publisher.publish_if_due(status_payload)
 
-                with client:
-                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    print(f"[INFO] Desktop connected: {address[0]}:{address[1]}")
-                    try:
-                        send_frames(client, cap, args, status_publisher)
-                    except (BrokenPipeError, ConnectionResetError):
-                        print("[WARN] Desktop disconnected. Waiting for a new connection...")
+            if not alive:
+                print(
+                    f"[ERROR] RTSP pipeline stopped. capture_return_code={capture_rc}, "
+                    f"ffmpeg_return_code={ffmpeg_rc}",
+                    file=sys.stderr,
+                )
+                return 1
+
+            time.sleep(1.0)
     finally:
+        processes.stop()
         status_publisher.close()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        run_server(args)
+        return run(args)
     except KeyboardInterrupt:
         print("\n[INFO] Stopped by user.")
         return 0
+    except FileNotFoundError as exc:
+        print(f"[ERROR] Required command not found: {exc.filename}", file=sys.stderr)
+        return 1
     except Exception as exc:  # noqa: BLE001 - CLI should show a concise runtime error.
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":
