@@ -8,13 +8,14 @@ Behavior:
        when it is shorter than 1 hour.
     4. Print short stdout messages for live stream errors and recovery.
     5. After connectivity returns, keep live viewing as the priority and slowly
-       download Raspberry Pi backlog files through HTTP.
+       download Raspberry Pi backlog files through HTTP in a background thread.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -94,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         "--backlog-check-interval",
         type=float,
         default=30.0,
-        help="Seconds between backlog manifest checks after live stream recovery.",
+        help="Seconds between backlog manifest checks.",
     )
     return parser.parse_args()
 
@@ -180,7 +181,7 @@ class SegmentRecorder:
 
 
 class BacklogDownloader:
-    """Slowly download Raspberry Pi local buffer files after live stream recovery."""
+    """Slowly download Raspberry Pi local buffer files without blocking live display."""
 
     def __init__(self, manifest_url: str | None, output_dir: Path, chunk_bytes: int, sleep_seconds: float) -> None:
         self.manifest_url = manifest_url
@@ -188,6 +189,7 @@ class BacklogDownloader:
         self.chunk_bytes = chunk_bytes
         self.sleep_seconds = sleep_seconds
         self.downloaded_names: set[str] = set()
+        self.lock = threading.Lock()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         for path in self.output_dir.iterdir():
@@ -196,6 +198,14 @@ class BacklogDownloader:
 
     def enabled(self) -> bool:
         return self.manifest_url is not None
+
+    def run_forever(self, stop_event: threading.Event, interval: float) -> None:
+        if not self.enabled():
+            return
+
+        while not stop_event.is_set():
+            self.sync_once()
+            stop_event.wait(interval)
 
     def sync_once(self) -> None:
         if self.manifest_url is None:
@@ -211,7 +221,11 @@ class BacklogDownloader:
         for item in manifest.get("files", []):
             name = item.get("name")
             relative_url = item.get("url")
-            if not name or not relative_url or name in self.downloaded_names:
+            if not name or not relative_url:
+                continue
+            with self.lock:
+                already_done = name in self.downloaded_names
+            if already_done:
                 continue
             self.download_file(name, urljoin(self.manifest_url, relative_url))
 
@@ -220,7 +234,8 @@ class BacklogDownloader:
         part_path = self.output_dir / f"{name}.part"
 
         if final_path.exists():
-            self.downloaded_names.add(name)
+            with self.lock:
+                self.downloaded_names.add(name)
             return
 
         print(f"BACKLOG_DOWNLOAD_START {name}", flush=True)
@@ -234,7 +249,8 @@ class BacklogDownloader:
                     output.flush()
                     time.sleep(self.sleep_seconds)
             part_path.rename(final_path)
-            self.downloaded_names.add(name)
+            with self.lock:
+                self.downloaded_names.add(name)
             print(f"BACKLOG_DOWNLOAD_DONE {name}", flush=True)
         except (OSError, URLError) as exc:
             print(f"BACKLOG_ERROR {name}: {exc}", flush=True)
@@ -257,8 +273,14 @@ def monitor_stream(args: argparse.Namespace) -> None:
         args.backlog_chunk_bytes,
         args.backlog_sleep_seconds,
     )
+    stop_event = threading.Event()
+    backlog_thread = threading.Thread(
+        target=backlog.run_forever,
+        args=(stop_event, args.backlog_check_interval),
+        daemon=True,
+    )
+    backlog_thread.start()
     was_connected = False
-    last_backlog_check_at = 0.0
 
     try:
         while True:
@@ -278,11 +300,6 @@ def monitor_stream(args: argparse.Namespace) -> None:
 
                     recorder.write(frame, stream_fps)
 
-                    now = time.monotonic()
-                    if backlog.enabled() and now - last_backlog_check_at >= args.backlog_check_interval:
-                        backlog.sync_once()
-                        last_backlog_check_at = now
-
                     if args.display:
                         cv2.imshow("RTSP Realtime Monitor", frame)
                         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -298,6 +315,8 @@ def monitor_stream(args: argparse.Namespace) -> None:
                 if capture is not None:
                     capture.release()
     finally:
+        stop_event.set()
+        backlog_thread.join(timeout=2.0)
         recorder.close()
         cv2.destroyAllWindows()
 
