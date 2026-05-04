@@ -1,6 +1,6 @@
-# Raspberry Pi RTSP Realtime Streaming + MQTT Status
+# Raspberry Pi RTSP Realtime Streaming + Offline Buffer + Backlog Sync
 
-이 저장소는 라즈베리 파이 카메라 영상을 RTSP 기반 실시간 스트림으로 송출하고, 데스크톱에서 해당 영상을 실시간 확인하며, 1시간 이상 연속 전송된 구간을 파일로 저장하는 예제입니다. MQTT는 라즈베리 파이 상태 정보를 전달하는 별도 저대역폭 채널로 유지합니다.
+이 저장소는 라즈베리 파이 카메라 영상을 RTSP 기반 실시간 스트림으로 송출하고, Wi-Fi와 Ethernet이 모두 끊긴 경우에도 라즈베리 파이 OS가 설치된 SD카드의 여유 공간에 영상을 1시간 단위로 순환 저장하는 예제입니다. 연결이 복구되면 데스크톱은 실시간 RTSP 영상을 우선 수신하고, 라즈베리 파이에 저장된 백로그 영상을 HTTP로 조금씩 내려받습니다.
 
 ## 1. 구성 개요
 
@@ -9,11 +9,15 @@
         |
         | libcamera-vid or ffmpeg
         v
-[RTSP Server: MediaMTX 등]
-        |
-        | rtsp://<raspberry-pi-ip>:8554/capstone
-        v
-[Desktop Viewer/Recorder]
+[ffmpeg tee]
+        |                         |
+        | RTSP live stream         | local 1-hour circular buffer
+        v                         v
+[RTSP Server]              [Raspberry Pi SD card]
+        |                         |
+        | live RTSP                | HTTP backlog server
+        v                         v
+[Desktop Viewer/Recorder]  [Desktop backlog downloader]
 
 [Raspberry Pi]
         |
@@ -22,18 +26,16 @@
 [MQTT Broker / Monitoring Client]
 ```
 
-## 2. 변경된 핵심 구조
+## 2. 핵심 동작
 
-이전 구현은 Python이 직접 JPEG 프레임을 TCP 소켓으로 전송하는 구조였습니다. 현재 구현은 RTSP 서버를 중심으로 동작합니다.
-
-| 구분 | 이전 구조 | 현재 구조 |
-|---|---|---|
-| 영상 전송 | 자체 TCP-JPEG 프레임 프로토콜 | RTSP 기반 H.264 스트림 |
-| 송신 주체 | Python OpenCV 루프 | `libcamera-vid` + `ffmpeg` 또는 `ffmpeg` V4L2 |
-| 수신 주체 | Python TCP 클라이언트 | OpenCV/FFmpeg RTSP 클라이언트 |
-| 호환성 | 전용 수신 코드 필요 | VLC, FFmpeg, NVR, OpenCV와 연동 가능 |
-| 상태 전송 | MQTT 선택 기능 | MQTT 유지, RTSP URL과 송출 상태 포함 |
-| 장시간 저장 | 없음 | 데스크톱에서 1시간 이상 연속 구간 저장 |
+| 상황 | 동작 |
+|---|---|
+| 정상 연결 | 라즈베리 파이는 RTSP 실시간 송출과 SD카드 1시간 단위 로컬 저장을 동시에 수행 |
+| Wi-Fi와 Ethernet 모두 끊김 | 라즈베리 파이는 표준출력에 `NETWORK_DOWN` 출력 후 SD카드 로컬 순환 저장 유지 |
+| 연결 복구 | 라즈베리 파이는 표준출력에 `NETWORK_RESTORED` 출력 후 RTSP 파이프라인 재시작 |
+| 데스크톱 수신 중 끊김 | 데스크톱은 표준출력에 `LIVE_ERROR ...` 출력, 현재 녹화 파일을 1시간 미만이어도 저장 |
+| 데스크톱 연결 복구 | 데스크톱은 `CONNECTION_RESTORED` 출력 후 실시간 RTSP 수신을 우선 수행 |
+| 복구 후 백로그 수신 | 데스크톱은 백그라운드 스레드에서 라즈베리 파이 저장 파일을 조금씩 다운로드 |
 
 ## 3. 파일 구조
 
@@ -50,34 +52,22 @@ capstone/
 
 | 파일 | 역할 |
 |---|---|
-| `src/raspi_video_sender.py` | 라즈베리 파이에서 RTSP 서버로 카메라 영상을 발행하고 MQTT 상태 전송 |
-| `src/desktop_video_receiver.py` | 데스크톱에서 RTSP 영상을 실시간 확인하고 1시간 이상 구간 저장 |
+| `src/raspi_video_sender.py` | RTSP 송출, 로컬 1시간 순환 저장, 네트워크 끊김 감지, HTTP 백로그 서버, MQTT 상태 전송 |
+| `src/desktop_video_receiver.py` | RTSP 실시간 확인, 끊김 즉시 파일 저장, 복구 메시지 출력, 백로그 저속 다운로드 |
 | `requirements.txt` | Python 의존성 목록 |
 | `report.md` | 코드 구조와 동작 원리 해석 |
-| `change.md` | TCP-JPEG에서 RTSP 구조로 변경된 내용 중심 설명 |
+| `change.md` | 주요 변경 사항 정리 |
 
 ## 4. 준비물
-
-### 하드웨어
 
 - Raspberry Pi 4 또는 Raspberry Pi 5
 - Raspberry Pi Camera Module 또는 USB 웹캠
 - 데스크톱 PC 또는 노트북
 - Wi-Fi 공유기 또는 Ethernet 케이블
-- MQTT 브로커를 실행할 장치
-- RTSP 서버를 실행할 장치. 실험에서는 Raspberry Pi에서 MediaMTX 실행 권장
-
-### 소프트웨어
-
-- Python 3.10 이상 권장
-- OpenCV
-- NumPy
-- Paho MQTT
-- psutil
-- FFmpeg
-- Raspberry Pi Camera Module 사용 시 `libcamera-vid`
 - RTSP 서버. 예: MediaMTX
 - MQTT 브로커. 예: Mosquitto
+- FFmpeg
+- Raspberry Pi Camera Module 사용 시 `libcamera-vid`
 
 ## 5. Python 의존성 설치
 
@@ -137,8 +127,6 @@ sudo systemctl enable --now mosquitto
 mosquitto_sub -h 192.168.0.10 -t capstone/raspi/status -v
 ```
 
-MQTT 상태 메시지는 RTSP URL, 송출 상태, 해상도, FPS, bitrate, CPU, 메모리, 디스크, 온도 정보를 포함합니다.
-
 ## 8. 라즈베리 파이 IP 확인
 
 ```bash
@@ -151,11 +139,9 @@ hostname -I
 192.168.0.23
 ```
 
-## 9. 라즈베리 파이에서 RTSP 송출 실행
+## 9. 라즈베리 파이에서 RTSP + 로컬 순환 저장 + 백로그 서버 실행
 
 ### 9.1 Raspberry Pi Camera Module 사용
-
-MediaMTX가 라즈베리 파이에서 실행 중이고, 데스크톱에서 볼 URL이 `rtsp://192.168.0.23:8554/capstone`인 경우:
 
 ```bash
 python3 src/raspi_video_sender.py \
@@ -166,8 +152,15 @@ python3 src/raspi_video_sender.py \
   --bitrate 2500000 \
   --rtsp-url rtsp://127.0.0.1:8554/capstone \
   --public-rtsp-url rtsp://192.168.0.23:8554/capstone \
-  --mqtt-host 192.168.0.10 \
-  --mqtt-topic capstone/raspi/status
+  --local-buffer-dir /home/pi/capstone_buffer \
+  --segment-seconds 3600 \
+  --min-free-gb 4 \
+  --max-buffer-gb 32 \
+  --backlog-host 0.0.0.0 \
+  --backlog-port 8080 \
+  --wifi-interface wlan0 \
+  --ethernet-interface eth0 \
+  --mqtt-host 192.168.0.10
 ```
 
 ### 9.2 USB 웹캠 사용
@@ -182,103 +175,97 @@ python3 src/raspi_video_sender.py \
   --bitrate 2500000 \
   --rtsp-url rtsp://127.0.0.1:8554/capstone \
   --public-rtsp-url rtsp://192.168.0.23:8554/capstone \
-  --mqtt-host 192.168.0.10
+  --local-buffer-dir /home/pi/capstone_buffer \
+  --segment-seconds 3600 \
+  --backlog-port 8080
 ```
 
-## 10. 데스크톱에서 실시간 확인 및 1시간 이상 저장
+## 10. 라즈베리 파이 표준출력 메시지
+
+| 메시지 | 의미 |
+|---|---|
+| `NETWORK_DOWN` | `wlan0`과 `eth0` 모두 IPv4 주소가 없거나 down 상태 |
+| `NETWORK_RESTORED` | Wi-Fi 또는 Ethernet 중 하나 이상 복구됨 |
+| `BUFFER_DELETE <file>` | SD카드 여유 공간 확보를 위해 가장 오래된 완료 영상 삭제 |
+| `PIPELINE_RESTART ...` | ffmpeg/libcamera 파이프라인 장애 감지 후 재시작 |
+
+## 11. 데스크톱에서 실시간 확인 + 끊김 파일 저장 + 백로그 수신
 
 ```bash
 python3 src/desktop_video_receiver.py \
   --url rtsp://192.168.0.23:8554/capstone \
   --output-dir recordings \
-  --segment-seconds 3600
+  --segment-seconds 3600 \
+  --backlog-manifest-url http://192.168.0.23:8080/manifest.json \
+  --backlog-output-dir raspi_backlog \
+  --backlog-chunk-bytes 262144 \
+  --backlog-sleep-seconds 0.2
 ```
 
 동작 방식:
 
-1. 데스크톱에서 RTSP 스트림을 실시간으로 표시합니다.
-2. 동시에 임시 파일에 프레임을 기록합니다.
-3. 연속 수신 시간이 `--segment-seconds` 이상이면 정상 녹화 파일로 확정 저장합니다.
-4. 기본값은 `3600`초, 즉 1시간입니다.
-5. 스트림이 1시간 전에 끊기면 기본적으로 해당 임시 파일은 삭제됩니다.
-6. 짧은 파일도 남기려면 `--keep-short-files`를 사용합니다.
+1. RTSP 실시간 영상을 우선 표시합니다.
+2. 실시간 영상은 데스크톱에도 파일로 기록됩니다.
+3. 정상적으로 1시간이 지나면 `rtsp_...avi` 파일로 저장됩니다.
+4. 중간에 끊기면 즉시 `interrupted_...avi` 파일로 저장됩니다.
+5. 연결이 복구되면 `CONNECTION_RESTORED`를 출력합니다.
+6. 라즈베리 파이 백로그 파일은 별도 백그라운드 스레드에서 천천히 다운로드됩니다.
+7. 백로그 다운로드는 `raspi_backlog/`에 저장됩니다.
 
-테스트 시에는 1시간을 기다리지 않도록 다음처럼 짧게 지정할 수 있습니다.
+## 12. 데스크톱 표준출력 메시지
 
-```bash
-python3 src/desktop_video_receiver.py \
-  --url rtsp://192.168.0.23:8554/capstone \
-  --segment-seconds 30
-```
+| 메시지 | 의미 |
+|---|---|
+| `CONNECTING <url>` | RTSP 연결 시도 |
+| `CONNECTION_RESTORED` | RTSP 연결 성공 또는 복구 |
+| `LIVE_ERROR <reason>` | 실시간 RTSP 수신 실패 |
+| `RECORD_START <file>` | 데스크톱 녹화 시작 |
+| `RECORD_SAVED <file>` | 1시간 완료 또는 끊김으로 인해 파일 저장 |
+| `BACKLOG_DOWNLOAD_START <file>` | 라즈베리 파이 백로그 파일 다운로드 시작 |
+| `BACKLOG_DOWNLOAD_DONE <file>` | 백로그 파일 다운로드 완료 |
+| `BACKLOG_ERROR <reason>` | 백로그 manifest 조회 또는 파일 다운로드 실패 |
 
-## 11. Wi-Fi와 Ethernet
+## 13. 백로그 manifest 확인
 
-코드 관점에서는 Wi-Fi와 Ethernet 모두 RTSP URL을 통해 접속하므로 실행 명령은 동일합니다. 차이는 네트워크 품질입니다.
-
-| 항목 | Wi-Fi | Ethernet |
-|---|---|---|
-| 설치 편의성 | 높음 | 케이블 필요 |
-| 지연 안정성 | 환경 영향 큼 | 상대적으로 안정적 |
-| 장시간 녹화 안정성 | 끊김 가능성 있음 | 더 적합 |
-| RTSP 스트리밍 | 가능 | 권장 |
-| MQTT 상태 전송 | 대역폭이 작아 보통 문제 적음 | 안정적 |
-
-1시간 이상 연속 저장을 목표로 할 경우 Ethernet을 우선 권장합니다.
-
-## 12. 문제 해결
-
-### RTSP 화면이 열리지 않는 경우
-
-확인 항목:
-
-1. RTSP 서버가 실행 중인지 확인
-2. 라즈베리 파이 송신 프로그램이 RTSP 서버에 정상 발행 중인지 확인
-3. 데스크톱에서 `rtsp://<라즈베리파이 IP>:8554/capstone` 주소를 사용했는지 확인
-4. 방화벽이 8554 포트를 차단하지 않는지 확인
-5. VLC 또는 FFmpeg로 같은 URL을 열어 확인
-
-### libcamera 명령을 찾을 수 없는 경우
-
-Raspberry Pi Camera Module을 쓰는 경우 Raspberry Pi OS의 camera stack이 필요합니다. USB 웹캠이면 `--source v4l2`를 사용합니다.
-
-### 영상이 느리거나 끊기는 경우
-
-대역폭을 줄입니다.
+브라우저 또는 curl로 확인할 수 있습니다.
 
 ```bash
-python3 src/raspi_video_sender.py \
-  --source libcamera \
-  --width 640 \
-  --height 480 \
-  --fps 15 \
-  --bitrate 1000000 \
-  --rtsp-url rtsp://127.0.0.1:8554/capstone
+curl http://192.168.0.23:8080/manifest.json
 ```
 
-### MQTT 상태 메시지가 안 보이는 경우
+응답 예시:
 
-```bash
-mosquitto_sub -h <MQTT 브로커 IP> -t capstone/raspi/status -v
+```json
+{
+  "generated_at": "2026-05-04T12:00:00+0900",
+  "segment_seconds": 3600,
+  "files": [
+    {
+      "name": "capstone_20260504_100000.ts",
+      "size": 1122334455,
+      "mtime": 1777860000.0,
+      "url": "/files/capstone_20260504_100000.ts"
+    }
+  ]
+}
 ```
 
-확인 항목:
+## 14. Wi-Fi와 Ethernet 장애 처리
 
-1. MQTT 브로커 실행 여부
-2. `--mqtt-host` 주소
-3. 1883 포트 접근 가능 여부
-4. 발행 토픽과 구독 토픽 일치 여부
+코드는 `--wifi-interface`와 `--ethernet-interface`로 지정된 인터페이스를 검사합니다. 기본값은 각각 `wlan0`, `eth0`입니다.
 
-## 13. 현재 구현의 한계
+둘 다 IPv4 주소가 없거나 down 상태가 되면 라즈베리 파이는 다음을 출력합니다.
+
+```text
+NETWORK_DOWN
+```
+
+이 상태에서도 로컬 저장은 계속됩니다. 저장 파일은 `--local-buffer-dir`에 1시간 단위로 생성되고, `--min-free-gb`, `--max-buffer-gb` 조건에 따라 오래된 파일부터 삭제됩니다.
+
+## 15. 주의 사항
 
 - RTSP 서버는 별도로 실행되어야 합니다.
-- 영상 RTSP 전송과 MQTT는 기본 설정에서 암호화되지 않습니다.
-- 데스크톱 저장 코드는 OpenCV `VideoWriter` 기반이므로 코덱 지원은 운영체제와 OpenCV 빌드 환경에 영향을 받습니다.
-- 파일 확정 기준은 데스크톱이 실제로 연속 수신한 시간입니다. 라즈베리 파이 송출 시간과 완전히 같지 않을 수 있습니다.
-
-## 14. 확장 방향
-
-- MediaMTX 설정 파일을 저장소에 추가
-- systemd 서비스 파일 추가
-- MQTT 인증/TLS 설정 추가
-- 데스크톱 녹화 파일을 MP4/H.264로 저장하도록 FFmpeg 기반 recorder 추가
-- YOLO/OpenCV 객체 탐지와 이벤트 기반 저장 기능 연결
+- RTSP와 HTTP 백로그 서버는 기본적으로 암호화되지 않습니다.
+- SD카드 수명과 저장 공간을 고려해야 합니다.
+- 1시간 단위 순환 저장은 완료된 segment 파일 기준입니다. 현재 쓰는 중인 파일은 백로그 manifest에 바로 노출하지 않습니다.
+- 백로그 다운로드는 실시간 영상을 우선하기 위해 작은 chunk와 sleep을 사용합니다.
