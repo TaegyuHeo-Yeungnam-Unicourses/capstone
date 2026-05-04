@@ -1,38 +1,43 @@
 #!/usr/bin/env python3
-"""Raspberry Pi realtime camera sender.
+"""Raspberry Pi realtime camera sender with MQTT status publishing.
 
-This program captures frames from a Raspberry Pi camera or USB camera,
-compresses each frame as JPEG, and sends the frame stream to one desktop
+This program continuously captures frames from a Raspberry Pi camera or USB
+camera, compresses every frame as JPEG, and streams the frames to one desktop
 client through a length-prefixed TCP socket.
 
-Network note:
-    Wi-Fi and Ethernet do not require different application code. Both expose
-    an IP address to the operating system, so the desktop only needs to connect
-    to the Raspberry Pi IP address and TCP port.
+It can also publish Raspberry Pi status information to an MQTT broker. The
+video stream and the status channel are intentionally separated:
+
+- TCP socket: high-bandwidth realtime video frames
+- MQTT: low-bandwidth device status telemetry
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import struct
 import sys
 import time
 from contextlib import closing
+from pathlib import Path
 
 import cv2
+import psutil
+import paho.mqtt.client as mqtt
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Send Raspberry Pi camera frames to a desktop over TCP."
+        description="Stream Raspberry Pi camera frames to a desktop over TCP and publish status over MQTT."
     )
     parser.add_argument(
         "--host",
         default="0.0.0.0",
         help="Bind address. Use 0.0.0.0 to listen on Wi-Fi and Ethernet interfaces.",
     )
-    parser.add_argument("--port", type=int, default=5000, help="TCP port to listen on.")
+    parser.add_argument("--port", type=int, default=5000, help="TCP video streaming port.")
     parser.add_argument(
         "--camera",
         default="0",
@@ -48,6 +53,28 @@ def parse_args() -> argparse.Namespace:
         choices=range(1, 101),
         metavar="1-100",
         help="JPEG quality. Lower values reduce bandwidth and image quality.",
+    )
+    parser.add_argument(
+        "--mqtt-host",
+        default=None,
+        help="MQTT broker host. If omitted, MQTT status publishing is disabled.",
+    )
+    parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port.")
+    parser.add_argument(
+        "--mqtt-topic",
+        default="capstone/raspi/status",
+        help="MQTT topic for Raspberry Pi status JSON.",
+    )
+    parser.add_argument(
+        "--mqtt-client-id",
+        default="capstone-raspi-video-sender",
+        help="MQTT client ID.",
+    )
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between MQTT status messages.",
     )
     return parser.parse_args()
 
@@ -73,9 +100,102 @@ def open_camera(args: argparse.Namespace) -> cv2.VideoCapture:
     return cap
 
 
-def send_frames(client: socket.socket, cap: cv2.VideoCapture, quality: int) -> None:
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+def read_cpu_temperature_celsius() -> float | None:
+    """Read Raspberry Pi CPU temperature when the Linux thermal file exists."""
+    temp_file = Path("/sys/class/thermal/thermal_zone0/temp")
+    if not temp_file.exists():
+        return None
+
+    try:
+        return int(temp_file.read_text(encoding="utf-8").strip()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+def local_ipv4_addresses() -> list[str]:
+    """Return local non-loopback IPv4 addresses for status monitoring."""
+    addresses: list[str] = []
+    for items in psutil.net_if_addrs().values():
+        for item in items:
+            if item.family == socket.AF_INET and not item.address.startswith("127."):
+                addresses.append(item.address)
+    return addresses
+
+
+def build_status_payload(
+    *,
+    client_connected: bool,
+    frames_sent: int,
+    fps_avg: float,
+    last_frame_bytes: int,
+    video_host: str,
+    video_port: int,
+) -> str:
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "hostname": socket.gethostname(),
+        "ip_addresses": local_ipv4_addresses(),
+        "video_host": video_host,
+        "video_port": video_port,
+        "client_connected": client_connected,
+        "frames_sent": frames_sent,
+        "fps_avg": round(fps_avg, 2),
+        "last_frame_bytes": last_frame_bytes,
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "memory_percent": memory.percent,
+        "disk_percent": disk.percent,
+        "cpu_temperature_celsius": read_cpu_temperature_celsius(),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class MqttStatusPublisher:
+    """Small wrapper that publishes Raspberry Pi status only when enabled."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.enabled = args.mqtt_host is not None
+        self.topic = args.mqtt_topic
+        self.interval = args.status_interval
+        self.last_published_at = 0.0
+        self.client: mqtt.Client | None = None
+
+        if not self.enabled:
+            return
+
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=args.mqtt_client_id)
+        self.client.connect(args.mqtt_host, args.mqtt_port, keepalive=30)
+        self.client.loop_start()
+        print(f"[INFO] MQTT status enabled: {args.mqtt_host}:{args.mqtt_port} topic={self.topic}")
+
+    def publish_if_due(self, payload: str) -> None:
+        if not self.enabled or self.client is None:
+            return
+
+        now = time.monotonic()
+        if now - self.last_published_at < self.interval:
+            return
+
+        self.client.publish(self.topic, payload, qos=0, retain=False)
+        self.last_published_at = now
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+
+def send_frames(
+    client: socket.socket,
+    cap: cv2.VideoCapture,
+    args: argparse.Namespace,
+    status_publisher: MqttStatusPublisher,
+) -> None:
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), args.quality]
     frame_count = 0
+    last_frame_bytes = 0
     started_at = time.monotonic()
 
     while True:
@@ -91,34 +211,71 @@ def send_frames(client: socket.socket, cap: cv2.VideoCapture, quality: int) -> N
             continue
 
         payload = buffer.tobytes()
-        header = struct.pack("!I", len(payload))
+        last_frame_bytes = len(payload)
+        header = struct.pack("!I", last_frame_bytes)
         client.sendall(header + payload)
 
         frame_count += 1
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        fps_avg = frame_count / elapsed
+
+        status_payload = build_status_payload(
+            client_connected=True,
+            frames_sent=frame_count,
+            fps_avg=fps_avg,
+            last_frame_bytes=last_frame_bytes,
+            video_host=args.host,
+            video_port=args.port,
+        )
+        status_publisher.publish_if_due(status_payload)
+
         if frame_count % 60 == 0:
-            elapsed = max(time.monotonic() - started_at, 0.001)
-            print(f"[INFO] Sent {frame_count} frames ({frame_count / elapsed:.1f} FPS avg)")
+            print(f"[INFO] Sent {frame_count} realtime frames ({fps_avg:.1f} FPS avg)")
+
+
+def publish_idle_status(args: argparse.Namespace, status_publisher: MqttStatusPublisher) -> None:
+    status_payload = build_status_payload(
+        client_connected=False,
+        frames_sent=0,
+        fps_avg=0.0,
+        last_frame_bytes=0,
+        video_host=args.host,
+        video_port=args.port,
+    )
+    status_publisher.publish_if_due(status_payload)
 
 
 def run_server(args: argparse.Namespace) -> None:
     cap = open_camera(args)
+    status_publisher = MqttStatusPublisher(args)
 
-    with closing(cap), socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((args.host, args.port))
-        server.listen(1)
-        print(f"[INFO] Listening on {args.host}:{args.port}")
-        print("[INFO] Run desktop_video_receiver.py from the desktop to connect.")
+    try:
+        with closing(cap), socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((args.host, args.port))
+            server.listen(1)
+            server.settimeout(1.0)
+            print(f"[INFO] Realtime video server listening on {args.host}:{args.port}")
+            print("[INFO] Run desktop_video_receiver.py from the desktop to connect.")
 
-        while True:
-            client, address = server.accept()
-            with client:
-                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                print(f"[INFO] Desktop connected: {address[0]}:{address[1]}")
+            while True:
+                publish_idle_status(args, status_publisher)
                 try:
-                    send_frames(client, cap, args.quality)
-                except (BrokenPipeError, ConnectionResetError):
-                    print("[WARN] Desktop disconnected. Waiting for a new connection...")
+                    client, address = server.accept()
+                except TimeoutError:
+                    continue
+                except socket.timeout:
+                    continue
+
+                with client:
+                    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    print(f"[INFO] Desktop connected: {address[0]}:{address[1]}")
+                    try:
+                        send_frames(client, cap, args, status_publisher)
+                    except (BrokenPipeError, ConnectionResetError):
+                        print("[WARN] Desktop disconnected. Waiting for a new connection...")
+    finally:
+        status_publisher.close()
 
 
 def main() -> int:
